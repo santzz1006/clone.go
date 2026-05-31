@@ -41,6 +41,13 @@ export const catalog = {
   },
 };
 
+export const FREE_TRIAL_PROMO = "free_trial_plus";
+
+export function isFreeTrialItem(item = {}) {
+  const productId = String(item.product_id || item.id || "").trim();
+  return productId === "plus" && item.promo === FREE_TRIAL_PROMO;
+}
+
 export function normalizeCheckoutItems(items = []) {
   if (!Array.isArray(items) || items.length === 0) {
     throw new Error("O carrinho precisa ter pelo menos um item.");
@@ -53,6 +60,17 @@ export function normalizeCheckoutItems(items = []) {
       throw new Error(`Produto invalido: ${productId || "sem id"}.`);
     }
 
+    if (isFreeTrialItem(item)) {
+      return {
+        product_id: product.id,
+        quantity: 1,
+        name: `${product.name} - Teste gratis`,
+        unit_price: 0,
+        total: 0,
+        promo: FREE_TRIAL_PROMO,
+      };
+    }
+
     const quantity = Math.max(Number.parseInt(item.quantity || item.qty || 1, 10), 1);
     return {
       product_id: product.id,
@@ -62,6 +80,14 @@ export function normalizeCheckoutItems(items = []) {
       total: Number((product.price * quantity).toFixed(2)),
     };
   });
+}
+
+export function hasPromoItem(items = []) {
+  return items.some((item) => Boolean(item.promo));
+}
+
+export function isFreeTrialCheckout(items = []) {
+  return items.length === 1 && items[0].product_id === "plus" && items[0].promo === FREE_TRIAL_PROMO;
 }
 
 export function calculateAmountCents(items) {

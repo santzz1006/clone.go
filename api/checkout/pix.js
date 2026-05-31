@@ -1,7 +1,7 @@
 import QRCode from "qrcode";
 import { getBearerToken, verifySessionToken } from "../../server/auth.js";
-import { calculateAmountCents, normalizeCheckoutItems } from "../../server/catalog.js";
-import { createCheckoutOrder, ensureCheckoutCustomer } from "../../server/supabase.js";
+import { calculateAmountCents, hasPromoItem, isFreeTrialCheckout, normalizeCheckoutItems } from "../../server/catalog.js";
+import { createCheckoutOrder, createFreeTrialOrder } from "../../server/supabase.js";
 import { createPixCashIn } from "../../server/syncpay.js";
 import { publicBaseUrl, readBody, requireMethod, sendError, sendJson, setCors, validateCustomer } from "../_utils.js";
 
@@ -23,9 +23,36 @@ export default async function handler(request, response) {
       return;
     }
 
-    await ensureCheckoutCustomer(customer);
-
     const items = normalizeCheckoutItems(body.items);
+    const freeTrial = isFreeTrialCheckout(items);
+    if (hasPromoItem(items) && !freeTrial) {
+      sendJson(response, 400, {
+        error: "Promocao invalida. O teste gratis precisa ser apenas do Plus Plan, 1 unidade.",
+        status: 400,
+      });
+      return;
+    }
+
+    if (freeTrial) {
+      const order = await createFreeTrialOrder({
+        customer,
+        briefing: body.briefing || {},
+        userId: session.id,
+      });
+
+      sendJson(response, 201, {
+        ok: true,
+        freeTrial: true,
+        orderId: order.id,
+        identifier: order.publicCode,
+        amountCents: 0,
+        amount: 0,
+        statusLabel: "Teste gratis liberado",
+        message: "Seu teste gratis do Plus Plan foi criado e enviado para a fila.",
+      });
+      return;
+    }
+
     const amountCents = calculateAmountCents(items);
     const pix = await createPixCashIn({
       amountCents,
@@ -42,6 +69,7 @@ export default async function handler(request, response) {
       customer,
       items: items.map(({ product_id, quantity }) => ({ product_id, quantity })),
       briefing: body.briefing || {},
+      userId: session.id,
       pix: {
         identifier: pix.identifier,
         pixCode: pix.pixCode,

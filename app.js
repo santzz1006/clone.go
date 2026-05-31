@@ -160,9 +160,33 @@ const money = {
 };
 
 const apiBaseUrl = ["5500", "5501", "5173"].includes(window.location.port) ? "http://localhost:3000" : "";
+const FREE_TRIAL_PROMO = "free_trial_plus";
+const TRIAL_OFFER_FLAG = "clonego_show_trial_offer";
+let remoteDashboardData = null;
+let remoteDashboardLoading = false;
 
 function apiUrl(path) {
   return `${apiBaseUrl}${path}`;
+}
+
+function onlyDigits(value = "") {
+  return String(value).replace(/\D/g, "");
+}
+
+function isValidCpf(value = "") {
+  const cpf = onlyDigits(value);
+  if (cpf.length !== 11 || /^(\d)\1{10}$/.test(cpf)) return false;
+
+  const calculateDigit = (length) => {
+    let sum = 0;
+    for (let index = 0; index < length; index += 1) {
+      sum += Number(cpf[index]) * (length + 1 - index);
+    }
+    const rest = (sum * 10) % 11;
+    return rest === 10 ? 0 : rest;
+  };
+
+  return calculateDigit(9) === Number(cpf[9]) && calculateDigit(10) === Number(cpf[10]);
 }
 
 function getSession() {
@@ -263,11 +287,39 @@ function saveCart(cart) {
   updateCartCount();
 }
 
+function isFreeTrialCartItem(item = {}) {
+  return item.id === "plus" && item.promo === FREE_TRIAL_PROMO;
+}
+
+function cartHasFreeTrial() {
+  return getCart().some(isFreeTrialCartItem);
+}
+
+function cartItemUnitPrice(item) {
+  if (isFreeTrialCartItem(item)) return 0;
+  return products[item.id]?.price || 0;
+}
+
+function cartItemTitle(item) {
+  const product = products[item.id];
+  if (isFreeTrialCartItem(item)) return `${product?.name || "Plus Plan"} - Teste gratis`;
+  return product?.name || "Produto";
+}
+
+function cartItemDescription(item) {
+  if (isFreeTrialCartItem(item)) return "Teste gratis promocional - limitado a 1 por CPF";
+  return `${item.qty} unidade(s)`;
+}
+
+function cartItemTotal(item) {
+  return cartItemUnitPrice(item) * item.qty;
+}
+
 function addToCart(id) {
   const item = products[id];
   if (!item) return;
 
-  const cart = getCart();
+  const cart = getCart().filter((cartItem) => !isFreeTrialCartItem(cartItem));
   const current = cart.find((cartItem) => cartItem.id === id);
   if (current) {
     current.qty += 1;
@@ -279,6 +331,10 @@ function addToCart(id) {
   toast(`${item.name} adicionado ao carrinho.`);
 }
 
+function addFreeTrialToCart() {
+  saveCart([{ id: "plus", qty: 1, promo: FREE_TRIAL_PROMO }]);
+}
+
 function removeFromCart(id) {
   saveCart(getCart().filter((item) => item.id !== id));
   renderCart();
@@ -288,7 +344,7 @@ function removeFromCart(id) {
 function cartTotal() {
   return getCart().reduce((total, item) => {
     const product = products[item.id];
-    return product ? total + product.price * item.qty : total;
+    return product ? total + cartItemTotal(item) : total;
   }, 0);
 }
 
@@ -307,15 +363,72 @@ function formatDateTime(value) {
   }).format(new Date(value));
 }
 
+function isDashboardPage() {
+  return Boolean(document.querySelector("#dashboardStats") || document.querySelector("#backpackList"));
+}
+
+function isDeliveredStatus(status) {
+  return ["delivered", "Delivered", "Entregue"].includes(String(status || ""));
+}
+
+function getDashboardOrders() {
+  return remoteDashboardData?.orders || getOrders();
+}
+
+function getDashboardFiles(deliveredOrders) {
+  if (remoteDashboardData?.files) return remoteDashboardData.files;
+
+  return deliveredOrders
+    .filter((order) => order.deliveryFile)
+    .map((order) => ({
+      id: order.deliveryFile,
+      name: order.deliveryFile,
+      url: order.deliveryUrl || "",
+      orderCode: order.id,
+      orderTitle: order.title,
+      createdAt: order.updatedAt || order.createdAt,
+    }));
+}
+
+async function loadDashboardFromApi() {
+  if (!isDashboardPage()) return;
+  const session = getSession();
+  if (!session?.token) return;
+
+  remoteDashboardLoading = true;
+  renderDashboard();
+
+  try {
+    const response = await fetch(apiUrl("/api/dashboard"), {
+      headers: authHeaders(),
+    });
+    const payload = await readApiResponse(response);
+    if (!response.ok) {
+      throw new Error(payload.error || "Nao foi possivel sincronizar a Mochila.");
+    }
+
+    remoteDashboardData = {
+      orders: Array.isArray(payload.orders) ? payload.orders : [],
+      files: Array.isArray(payload.files) ? payload.files : [],
+    };
+  } catch (error) {
+    console.error(error);
+    toast(error.message || "Nao foi possivel sincronizar a Mochila.");
+  } finally {
+    remoteDashboardLoading = false;
+    renderDashboard();
+  }
+}
+
 function createOrderFromCheckout(requestData) {
   const cart = getCart();
   const items = cart.map((item) => {
-    const product = products[item.id];
     return {
       id: item.id,
-      name: product?.name || "Produto",
+      name: cartItemTitle(item),
       qty: item.qty,
-      price: product?.price || 0,
+      price: cartItemUnitPrice(item),
+      promo: item.promo || null,
     };
   });
   const now = new Date().toISOString();
@@ -364,12 +477,12 @@ function createOrderFromCheckout(requestData) {
 function createPendingPixOrder({ checkoutData, pixResult }) {
   const cart = getCart();
   const items = cart.map((item) => {
-    const product = products[item.id];
     return {
       id: item.id,
-      name: product?.name || "Produto",
+      name: cartItemTitle(item),
       qty: item.qty,
-      price: product?.price || 0,
+      price: cartItemUnitPrice(item),
+      promo: item.promo || null,
     };
   });
   const now = new Date().toISOString();
@@ -404,6 +517,45 @@ function createPendingPixOrder({ checkoutData, pixResult }) {
   };
 }
 
+function createFreeTrialLocalOrder({ checkoutData, trialResult }) {
+  const now = new Date().toISOString();
+  return {
+    id: trialResult.identifier || trialResult.orderId,
+    publicCode: trialResult.identifier,
+    title: "Teste gratis - Plus Plan Structured",
+    items: [
+      {
+        id: "plus",
+        name: "Plus Plan Structured - Teste gratis",
+        qty: 1,
+        price: 0,
+        promo: FREE_TRIAL_PROMO,
+      },
+    ],
+    request: checkoutData,
+    total: 0,
+    status: "payment_confirmed",
+    statusLabel: "Teste gratis liberado",
+    progress: 35,
+    createdAt: now,
+    updatedAt: now,
+    message: "Seu teste gratis do Plus Plan foi enviado para a fila de producao.",
+    deliveryFile: null,
+    history: [
+      {
+        status: "Teste gratis liberado",
+        at: now,
+        text: "Promocao aplicada com valor R$ 0,00. Limite: 1 teste gratis por CPF.",
+      },
+      {
+        status: "Briefing recebido",
+        at: now,
+        text: "O briefing do teste gratis foi salvo junto ao pedido.",
+      },
+    ],
+  };
+}
+
 function markLocalOrderAsPaid(identifier) {
   const orders = getOrders();
   const now = new Date().toISOString();
@@ -433,6 +585,7 @@ function checkoutItemsPayload() {
   return getCart().map((item) => ({
     product_id: item.id,
     quantity: item.qty,
+    promo: item.promo || undefined,
   }));
 }
 
@@ -459,6 +612,22 @@ function renderPixPayment(pixResult) {
         <button class="btn btn-primary full" data-copy-pix type="button">Copiar codigo Pix</button>
         <button class="btn btn-secondary full" data-check-pix="${pixResult.identifier}" type="button">Verificar pagamento</button>
       </div>
+    </section>
+  `;
+}
+
+function renderFreeTrialConfirmation(trialResult) {
+  const box = document.querySelector("#pixPaymentBox");
+  if (!box) return;
+
+  box.innerHTML = `
+    <section class="pix-box free-trial-box" aria-live="polite">
+      <div>
+        <span class="trial-pill">Teste gratis aplicado</span>
+        <h3>Plus Plan liberado por R$ 0,00</h3>
+        <p>Pedido ${trialResult.identifier} criado e enviado para a fila. A promocao e limitada a 1 teste gratis por CPF.</p>
+      </div>
+      <a class="btn btn-primary full" href="dashboard.html">Acompanhar na Mochila</a>
     </section>
   `;
 }
@@ -507,6 +676,76 @@ function toast(message) {
   toastNode.classList.add("show");
   window.clearTimeout(window.toastTimer);
   window.toastTimer = window.setTimeout(() => toastNode.classList.remove("show"), 2800);
+}
+
+function trialOfferSeenKey() {
+  return `clonego_trial_offer_seen_${getSession()?.user?.email || "guest"}`;
+}
+
+function shouldOfferTrialAfterAuth(targetUrl) {
+  return !String(targetUrl || "").includes("checkout.html");
+}
+
+function prepareTrialOfferAfterAuth(targetUrl) {
+  if (shouldOfferTrialAfterAuth(targetUrl)) {
+    localStorage.setItem(TRIAL_OFFER_FLAG, "1");
+  }
+}
+
+function closeTrialOfferModal(markSeen = true) {
+  const modal = document.querySelector("#trialOfferModal");
+  if (!modal) return;
+  if (markSeen) localStorage.setItem(trialOfferSeenKey(), "1");
+  modal.classList.remove("is-open");
+  window.setTimeout(() => modal.remove(), 180);
+}
+
+function showTrialOfferModal() {
+  if (document.querySelector("#trialOfferModal")) return;
+
+  const modal = document.createElement("div");
+  modal.id = "trialOfferModal";
+  modal.className = "modal-backdrop trial-offer-backdrop";
+  modal.innerHTML = `
+    <section class="product-modal trial-offer-modal" role="dialog" aria-modal="true" aria-labelledby="trialOfferTitle">
+      <button class="modal-close" data-close-trial-offer type="button" aria-label="Fechar">x</button>
+      <span class="trial-pill">Bonus de boas-vindas</span>
+      <h2 id="trialOfferTitle">Voce ganhou um teste gratis do Plus Plan.</h2>
+      <p class="modal-description">Use o Plus Plan Structured por R$ 0,00 para testar o fluxo do site, enviar seu briefing e receber o pedido na Mochila.</p>
+      <div class="trial-terms">
+        <strong>Termos da promocao</strong>
+        <p>Oferta limitada a 1 teste gratis por CPF. Ao usar o teste, o pedido entra no carrinho com valor R$ 0,00 e segue para o checkout normal. CPFs que ja usaram o bonus nao conseguem gerar outro teste.</p>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-primary" data-use-trial-offer type="button">Usar teste</button>
+        <button class="btn btn-secondary" data-close-trial-offer type="button">Agora nao</button>
+      </div>
+    </section>
+  `;
+  document.body.appendChild(modal);
+  requestAnimationFrame(() => modal.classList.add("is-open"));
+}
+
+function useTrialOffer() {
+  addFreeTrialToCart();
+  localStorage.setItem(trialOfferSeenKey(), "1");
+  localStorage.removeItem(TRIAL_OFFER_FLAG);
+  closeTrialOfferModal(false);
+  renderCart();
+  renderCheckout();
+  toast("Teste gratis adicionado ao carrinho.");
+  window.setTimeout(() => {
+    window.location.href = rootPath("checkout.html");
+  }, 350);
+}
+
+function maybeShowTrialOffer() {
+  const session = getSession();
+  if (!session?.token || !session?.user?.email) return;
+  if (localStorage.getItem(TRIAL_OFFER_FLAG) !== "1") return;
+  if (localStorage.getItem(trialOfferSeenKey()) === "1") return;
+  localStorage.removeItem(TRIAL_OFFER_FLAG);
+  window.setTimeout(showTrialOfferModal, 500);
 }
 
 function initTheme() {
@@ -773,8 +1012,8 @@ function renderCart() {
         return `
           <article class="cart-item">
             <div>
-              <h3>${product.name}</h3>
-              <p>${item.qty} unidade(s) - ${money.format(product.price * item.qty)}</p>
+              <h3>${cartItemTitle(item)}</h3>
+              <p>${cartItemDescription(item)} - ${money.format(cartItemTotal(item))}</p>
             </div>
             <button class="remove-btn" data-remove-cart="${item.id}" type="button">Remover</button>
           </article>
@@ -812,11 +1051,11 @@ function renderCheckout() {
               <div class="compact-item-main">
                 <span class="compact-item-icon">${icons[productIcons[item.id]] || icons.stack}</span>
                 <div>
-                  <h3>${product.name}</h3>
-                  <p>${item.qty} unidade(s)</p>
+                  <h3>${cartItemTitle(item)}</h3>
+                  <p>${cartItemDescription(item)}</p>
                 </div>
               </div>
-              <strong>${money.format(product.price * item.qty)}</strong>
+              <strong>${money.format(cartItemTotal(item))}</strong>
             </article>
           `;
         })
@@ -833,19 +1072,35 @@ function renderCheckout() {
 
   const total = document.querySelector("#checkoutTotal");
   if (total) total.textContent = money.format(cartTotal());
+
+  const status = document.querySelector("#paymentStatus");
+  const pixBox = document.querySelector("#pixPaymentBox");
+  if (status && !pixBox?.innerHTML.trim()) {
+    status.innerHTML = cartHasFreeTrial()
+      ? `<strong>Teste gratis Plus Plan</strong><span>Finalize o briefing para enviar o pedido com valor R$ 0,00. Promocao limitada a 1 por CPF.</span>`
+      : `<strong>Aguardando Pix</strong><span>O pedido sera salvo no banco e liberado apos a confirmacao do pagamento Pix.</span>`;
+  }
+
+  const submitButton = document.querySelector("#simulatePayment");
+  if (submitButton) {
+    submitButton.innerHTML = cartHasFreeTrial()
+      ? `<span data-icon="layout"></span> Confirmar teste gratis`
+      : `<span data-icon="credit"></span> Gerar Pix`;
+    injectIcons();
+  }
 }
 
 function renderDashboard() {
-  const orders = getOrders();
-  const activeOrders = orders.filter((order) => order.status !== "Delivered");
-  const deliveredOrders = orders.filter((order) => order.status === "Delivered");
+  const orders = getDashboardOrders();
+  const activeOrders = orders.filter((order) => !isDeliveredStatus(order.status));
+  const deliveredOrders = orders.filter((order) => isDeliveredStatus(order.status));
   const latestOrder = orders[0];
   const stats = document.querySelector("#dashboardStats");
   if (stats) {
     stats.innerHTML = `
       <article class="panel stat-card"><span>Pedidos ativos</span><strong>${activeOrders.length}</strong></article>
-      <article class="panel stat-card"><span>Entregas liberadas</span><strong>${deliveredOrders.length}</strong></article>
-      <article class="panel stat-card"><span>Status atual</span><strong>${latestOrder ? latestOrder.statusLabel : "Sem pedido"}</strong></article>
+      <article class="panel stat-card"><span>Entregas liberadas</span><strong>${getDashboardFiles(deliveredOrders).length}</strong></article>
+      <article class="panel stat-card"><span>Status atual</span><strong>${remoteDashboardLoading ? "Sincronizando" : latestOrder ? latestOrder.statusLabel : "Sem pedido"}</strong></article>
     `;
   }
 
@@ -909,21 +1164,32 @@ function renderDashboard() {
 
   const backpack = document.querySelector("#backpackList");
   if (backpack) {
-    const files = deliveredOrders.filter((order) => order.deliveryFile);
+    const files = getDashboardFiles(deliveredOrders);
     backpack.innerHTML = files.length
       ? files
           .map(
-            (order) => `
+            (file) => `
         <article class="delivery-item">
           <div>
-            <h3>${order.deliveryFile}</h3>
-            <p>Pedido ${order.id}</p>
+            <h3>${file.name}</h3>
+            <p>Pedido ${file.orderCode || file.orderId}</p>
           </div>
-          <button class="btn btn-primary" data-download="${order.deliveryFile}" type="button">Download</button>
+          ${
+            file.url
+              ? `<a class="btn btn-primary" href="${file.url}" target="_blank" rel="noopener" data-download="${file.name}" data-download-url="${file.url}">Download</a>`
+              : `<button class="btn btn-primary" data-download="${file.name}" type="button">Download</button>`
+          }
         </article>
       `,
           )
           .join("")
+      : remoteDashboardLoading
+        ? `
+        <article class="empty-state compact">
+          <h3>Sincronizando Mochila</h3>
+          <p>Buscando seus arquivos liberados no banco de dados.</p>
+        </article>
+      `
       : `
         <article class="empty-state compact">
           <h3>Nenhum arquivo liberado ainda</h3>
@@ -987,10 +1253,12 @@ function initForms() {
           token: result.token,
           user: result.user,
         });
+        const targetUrl = nextAuthUrl("marketplace.html");
+        prepareTrialOfferAfterAuth(targetUrl);
         localStorage.removeItem("afterLoginRedirect");
         toast("Login realizado.");
         window.setTimeout(() => {
-          window.location.href = nextAuthUrl("marketplace.html");
+          window.location.href = targetUrl;
         }, 350);
       } catch (error) {
         toast(error.message);
@@ -1025,10 +1293,12 @@ function initForms() {
           token: result.token,
           user: result.user,
         });
+        const targetUrl = nextAuthUrl("marketplace.html");
+        prepareTrialOfferAfterAuth(targetUrl);
         localStorage.removeItem("afterLoginRedirect");
         toast("Conta criada.");
         window.setTimeout(() => {
-          window.location.href = nextAuthUrl("marketplace.html");
+          window.location.href = targetUrl;
         }, 350);
       } catch (error) {
         toast(error.message);
@@ -1052,13 +1322,27 @@ function initForms() {
 
       const submitButton = checkout.querySelector("[type='submit']");
       const data = Object.fromEntries(new FormData(checkout));
+      const isTrialCheckout = cartHasFreeTrial();
+      data.cpf = onlyDigits(data.cpf);
+      if (!isValidCpf(data.cpf)) {
+        setPaymentStatus("CPF invalido", "Confira os digitos do CPF antes de finalizar.");
+        toast("CPF invalido. Confira os digitos informados.");
+        return;
+      }
       localStorage.setItem("lastOrderRequest", JSON.stringify(data));
 
       try {
         submitButton.disabled = true;
-        submitButton.innerHTML = `<span data-icon="credit"></span> Gerando Pix...`;
+        submitButton.innerHTML = isTrialCheckout
+          ? `<span data-icon="layout"></span> Confirmando teste...`
+          : `<span data-icon="credit"></span> Gerando Pix...`;
         injectIcons();
-        setPaymentStatus("Gerando Pix", "Estamos criando a cobranca na Syncpay e salvando o pedido no banco.");
+        setPaymentStatus(
+          isTrialCheckout ? "Confirmando teste gratis" : "Gerando Pix",
+          isTrialCheckout
+            ? "Estamos salvando o pedido promocional no banco com valor R$ 0,00."
+            : "Estamos criando a cobranca na Syncpay e salvando o pedido no banco.",
+        );
 
         const response = await fetch(apiUrl("/api/checkout/pix"), {
           method: "POST",
@@ -1085,7 +1369,20 @@ function initForms() {
         const pixResult = await readApiResponse(response);
 
         if (!response.ok) {
-          throw new Error(pixResult.error || "Nao foi possivel gerar o Pix.");
+          throw new Error(
+            pixResult.error || (isTrialCheckout ? "Nao foi possivel confirmar o teste gratis." : "Nao foi possivel gerar o Pix."),
+          );
+        }
+
+        if (pixResult.freeTrial) {
+          const order = createFreeTrialLocalOrder({ checkoutData: data, trialResult: pixResult });
+          saveOrders([order, ...getOrders()]);
+          saveCart([]);
+          renderCheckout();
+          renderFreeTrialConfirmation(pixResult);
+          setPaymentStatus("Teste gratis criado", "Seu pedido Plus Plan de R$ 0,00 foi enviado para a fila.");
+          toast("Teste gratis criado e salvo no banco.");
+          return;
         }
 
         const order = createPendingPixOrder({ checkoutData: data, pixResult });
@@ -1101,7 +1398,9 @@ function initForms() {
         toast(error.message);
       } finally {
         submitButton.disabled = false;
-        submitButton.innerHTML = `<span data-icon="credit"></span> Gerar Pix`;
+        submitButton.innerHTML = cartHasFreeTrial()
+          ? `<span data-icon="layout"></span> Confirmar teste gratis`
+          : `<span data-icon="credit"></span> Gerar Pix`;
         injectIcons();
       }
     });
@@ -1134,6 +1433,13 @@ function initEvents() {
       closeProductModal();
     }
 
+    if (event.target.matches("[data-close-trial-offer]") || event.target.id === "trialOfferModal") {
+      closeTrialOfferModal();
+    }
+
+    const trialButton = event.target.closest("[data-use-trial-offer]");
+    if (trialButton) useTrialOffer();
+
     const backpackTab = event.target.closest("[data-backpack-tab]");
     if (backpackTab) {
       const tab = backpackTab.dataset.backpackTab;
@@ -1147,7 +1453,13 @@ function initEvents() {
     if (removeButton) removeFromCart(removeButton.dataset.removeCart);
 
     const downloadButton = event.target.closest("[data-download]");
-    if (downloadButton) toast(`Preparando download: ${downloadButton.dataset.download}`);
+    if (downloadButton) {
+      const downloadUrl = downloadButton.dataset.downloadUrl;
+      if (downloadUrl && downloadButton.tagName !== "A") {
+        window.open(downloadUrl, "_blank", "noopener");
+      }
+      toast(downloadUrl ? `Abrindo download: ${downloadButton.dataset.download}` : `Preparando download: ${downloadButton.dataset.download}`);
+    }
 
     const logoutButton = event.target.closest("[data-logout]");
     if (logoutButton) {
@@ -1208,8 +1520,19 @@ function initEvents() {
     });
   });
 
+  document.querySelectorAll('input[name="cpf"]').forEach((input) => {
+    input.addEventListener("blur", () => {
+      const value = onlyDigits(input.value);
+      input.setCustomValidity(value && !isValidCpf(value) ? "CPF invalido." : "");
+    });
+    input.addEventListener("input", () => input.setCustomValidity(""));
+  });
+
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") closeProductModal();
+    if (event.key === "Escape") {
+      closeProductModal();
+      closeTrialOfferModal();
+    }
   });
 }
 
@@ -1223,9 +1546,11 @@ function boot() {
   renderCart();
   renderCheckout();
   renderDashboard();
+  loadDashboardFromApi();
   if (typeof renderAdmin === "function") renderAdmin();
   initForms();
   initEvents();
+  maybeShowTrialOffer();
 }
 
 document.addEventListener("DOMContentLoaded", boot);
