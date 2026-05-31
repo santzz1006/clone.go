@@ -1,7 +1,7 @@
 import QRCode from "qrcode";
 import { getBearerToken, verifySessionToken } from "../../server/auth.js";
 import { calculateAmountCents, normalizeCheckoutItems } from "../../server/catalog.js";
-import { createCheckoutOrder } from "../../server/supabase.js";
+import { createCheckoutOrder, ensureCheckoutCustomer } from "../../server/supabase.js";
 import { createPixCashIn } from "../../server/syncpay.js";
 import { publicBaseUrl, readBody, requireMethod, sendError, sendJson, setCors, validateCustomer } from "../_utils.js";
 
@@ -22,6 +22,8 @@ export default async function handler(request, response) {
       sendJson(response, 403, { error: "Use no checkout o mesmo e-mail da conta logada.", status: 403 });
       return;
     }
+
+    await ensureCheckoutCustomer(customer);
 
     const items = normalizeCheckoutItems(body.items);
     const amountCents = calculateAmountCents(items);
